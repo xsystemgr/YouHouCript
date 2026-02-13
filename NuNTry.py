@@ -1,39 +1,23 @@
 # -*- coding: utf-8 -*-
-"""
-Cipher Lab GUI (Tkinter)
-- Paste/Load transmissions
-- Parse tokens: prefixes, ids, codewords, numeric groups
-- Stats: digit frequency, entropy, repetitions
-- Grid decoder: 10x10 (00-99) with configurable alphabet (100 chars)
-- Vigenere numeric experiments:
-    * mod26 on (group % 26) -> letters
-    * mod100 on (pairs 00-99)
-    * mod10000 on 4-digit groups
-- Auto hypothesis tester:
-    * Break classical Vigenere on mod26 stream via chi-squared (English)
-    * Suggest key for key lengths 1..N, show best candidates
-"""
-
 import re
 import math
+import threading
+import queue
+import time
+from collections import Counter
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # -----------------------------
-# Helpers: parsing & stats
+# Parsing
 # -----------------------------
 LINE_RE = re.compile(r'^\s*([A-Za-z]+)\s+(\d{5})\s+(.*)$')
 
 def extract_numeric_groups(text):
-    # capture 4 or 5 digit groups (keeps leading zeros)
     return re.findall(r'\b\d{4,5}\b', text)
 
 def extract_tokens_per_line(text):
-    """
-    Parse each line into:
-      prefix, msg_id, remaining_tokens(list)
-    remaining tokens may include words and numeric groups.
-    """
     records = []
     for raw in text.splitlines():
         line = raw.strip()
@@ -41,52 +25,49 @@ def extract_tokens_per_line(text):
             continue
         m = LINE_RE.match(line)
         if not m:
-            # store unparsed line
             records.append({"raw": raw, "parsed": False})
             continue
         prefix, msg_id, rest = m.group(1), m.group(2), m.group(3)
         tokens = rest.split()
+        nums = [t for t in tokens if re.fullmatch(r"\d{4,5}", t)]
+        words = [t for t in tokens if not re.fullmatch(r"\d{4,5}", t)]
         records.append({
             "raw": raw,
             "parsed": True,
             "prefix": prefix,
             "msg_id": msg_id,
-            "tokens": tokens
+            "tokens": tokens,
+            "nums": nums,
+            "words": words
         })
     return records
 
-def digit_frequency(numbers):
-    digits = "".join(numbers)
-    from collections import Counter
-    c = Counter(digits)
-    return {d: c.get(d, 0) for d in "0123456789"}, len(digits)
-
+# -----------------------------
+# Stats
+# -----------------------------
 def shannon_entropy_digits(numbers):
     digits = "".join(numbers)
     if not digits:
         return 0.0
-    from collections import Counter
     c = Counter(digits)
     total = len(digits)
     ent = 0.0
-    for k, v in c.items():
+    for v in c.values():
         p = v / total
         ent -= p * math.log2(p)
     return ent
 
+def digit_frequency(numbers):
+    digits = "".join(numbers)
+    c = Counter(digits)
+    return {d: c.get(d, 0) for d in "0123456789"}, len(digits)
+
 def repetitions(numbers):
-    from collections import Counter
     c = Counter(numbers)
     return [(k, v) for k, v in c.items() if v > 1]
 
-def safe_int(s):
-    try:
-        return int(s)
-    except:
-        return None
-
 # -----------------------------
-# Grid decoder (00-99)
+# Grid decoder 00-99
 # -----------------------------
 DEFAULT_ALPHABET_100 = (
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -94,48 +75,32 @@ DEFAULT_ALPHABET_100 = (
     "0123456789"
     " .,;:!?@#$/\\-_=+()[]{}<>"
 )
-# Ensure length 100
 DEFAULT_ALPHABET_100 = (DEFAULT_ALPHABET_100 + ("~" * 100))[:100]
 
-def grid_decode_pairs(pairs, alphabet100):
-    """
-    pairs: list of strings "00".."99"
-    map pair -> alphabet100[int(pair)]
-    """
-    out = []
-    for p in pairs:
-        if len(p) != 2 or not p.isdigit():
-            out.append("�")
-            continue
-        idx = int(p)
-        if 0 <= idx < 100:
-            out.append(alphabet100[idx])
-        else:
-            out.append("�")
-    return "".join(out)
-
-def numbers_to_pairs_00_99(numbers):
-    """
-    Convert list of 4/5-digit groups into 2-digit pairs (00-99) by chunking digits.
-    Example: "4413" -> ["44","13"]
-             "06476" -> ["06","47","6?"] -> last odd digit becomes "6?" -> mark
-    We will pad odd digit with "0" at end: "6" -> "60" (configurable; here fixed)
-    """
+def numbers_to_pairs_00_99(numbers, pad_last_digit=True):
     pairs = []
     for g in numbers:
         s = g.strip()
-        # chunk into pairs
         i = 0
         while i < len(s):
             chunk = s[i:i+2]
             if len(chunk) == 1:
-                chunk = chunk + "0"  # pad
-            pairs.append(chunk)
+                chunk = (chunk + "0") if pad_last_digit else chunk
+            if len(chunk) == 2 and chunk.isdigit():
+                pairs.append(chunk)
             i += 2
     return pairs
 
+def grid_decode_pairs(pairs, alphabet100):
+    out = []
+    alpha = (alphabet100 + ("~" * 100))[:100]
+    for p in pairs:
+        idx = int(p)
+        out.append(alpha[idx] if 0 <= idx < 100 else "�")
+    return "".join(out)
+
 # -----------------------------
-# Vigenere on mod26 stream
+# Vigenere + scoring (EN mod26)
 # -----------------------------
 ENGLISH_FREQ = {
     "A": 0.08167, "B": 0.01492, "C": 0.02782, "D": 0.04253, "E": 0.12702,
@@ -146,11 +111,7 @@ ENGLISH_FREQ = {
     "Z": 0.00074
 }
 
-def chi_squared_score(text):
-    """
-    Lower is better.
-    text assumed uppercase A-Z only (we ignore others).
-    """
+def chi_squared_score_en(text):
     if not text:
         return float("inf")
     counts = {ch: 0 for ch in ENGLISH_FREQ}
@@ -169,211 +130,272 @@ def chi_squared_score(text):
             score += ((observed - expected) ** 2) / expected
     return score
 
-def vigenere_decrypt_mod26(values, key):
-    """
-    values: list ints 0..25
-    key: list ints 0..25
-    returns letters A-Z
-    """
+def vigenere_decrypt_modN_to_letters(values, key, N, alphabet):
     out = []
     klen = len(key)
     for i, v in enumerate(values):
-        p = (v - key[i % klen]) % 26
-        out.append(chr(p + 65))
+        p = (v - key[i % klen]) % N
+        out.append(alphabet[p])
     return "".join(out)
 
-def find_best_caesar_for_column(col_vals):
-    """
-    For a set of values (0..25) assuming Caesar shift,
-    find shift that yields lowest chi-squared when decoded.
-    """
+def find_best_caesar_for_column(values, N, alphabet, score_fn):
     best_shift = 0
     best_score = float("inf")
-    for shift in range(26):
-        decoded = "".join(chr(((v - shift) % 26) + 65) for v in col_vals)
-        s = chi_squared_score(decoded)
+    for shift in range(N):
+        decoded = "".join(alphabet[(v - shift) % N] for v in values)
+        s = score_fn(decoded)
         if s < best_score:
             best_score = s
             best_shift = shift
     return best_shift, best_score
 
-def break_vigenere_mod26(values, max_keylen=12, top_k=5):
-    """
-    Classic Vigenere break:
-    - for each keylen, solve each column as Caesar via chi-squared
-    - compute overall score, keep best candidates
-    """
+def break_vigenere(values, N, alphabet, score_fn, max_keylen=16, top_k=8):
     candidates = []
     for klen in range(1, max_keylen + 1):
         key = []
-        total_score = 0.0
         for i in range(klen):
             col = [values[j] for j in range(i, len(values), klen)]
-            shift, score = find_best_caesar_for_column(col)
+            shift, _ = find_best_caesar_for_column(col, N, alphabet, score_fn)
             key.append(shift)
-            total_score += score
-        plaintext = vigenere_decrypt_mod26(values, key)
-        overall = chi_squared_score(plaintext)
+        plaintext = vigenere_decrypt_modN_to_letters(values, key, N, alphabet)
+        overall = score_fn(plaintext)
         candidates.append({
             "keylen": klen,
             "key": key,
-            "key_text": "".join(chr(k + 65) for k in key),
+            "key_text": "".join(alphabet[k] for k in key),
             "score": overall,
-            "preview": plaintext[:200]
+            "preview": plaintext[:240]
         })
     candidates.sort(key=lambda x: x["score"])
     return candidates[:top_k]
 
 # -----------------------------
-# Vigenere numeric experiments
+# Russian mod33 scoring
+# -----------------------------
+RU_ALPHABET = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
+RU_FREQ = {
+    "О": 0.1097, "Е": 0.0845, "А": 0.0801, "И": 0.0735, "Н": 0.0670,
+    "Т": 0.0626, "С": 0.0547, "Р": 0.0473, "В": 0.0454, "Л": 0.0440,
+    "К": 0.0349, "М": 0.0321, "Д": 0.0298, "П": 0.0281, "У": 0.0262,
+    "Я": 0.0201, "Ы": 0.0190, "Ь": 0.0174, "Г": 0.0170, "З": 0.0165,
+    "Б": 0.0159, "Ч": 0.0144, "Й": 0.0121, "Х": 0.0097, "Ж": 0.0094,
+    "Ш": 0.0073, "Ю": 0.0064, "Ц": 0.0048, "Щ": 0.0036, "Э": 0.0032,
+    "Ф": 0.0026, "Ъ": 0.0004, "Ё": 0.0004
+}
+
+def chi_squared_score_ru(text):
+    if not text:
+        return float("inf")
+    counts = {ch: 0 for ch in RU_ALPHABET}
+    n = 0
+    for ch in text:
+        if ch in counts:
+            counts[ch] += 1
+            n += 1
+    if n == 0:
+        return float("inf")
+    score = 0.0
+    for ch in RU_ALPHABET:
+        exp = RU_FREQ.get(ch, 0.0)
+        expected = n * exp
+        observed = counts[ch]
+        if expected > 0:
+            score += ((observed - expected) ** 2) / expected
+    return score
+
+# -----------------------------
+# Numeric Vigenere experiments (mod100/mod10000)
 # -----------------------------
 def vigenere_decrypt_modN(nums, key_nums, modN):
-    """
-    nums: list ints
-    key_nums: list ints
-    returns list ints plaintext
-    """
     out = []
     klen = len(key_nums)
     for i, c in enumerate(nums):
-        p = (c - key_nums[i % klen]) % modN
-        out.append(p)
+        out.append((c - key_nums[i % klen]) % modN)
     return out
 
-def ints_to_printable_ascii(vals):
-    """
-    map ints (0..255 expected) to text, replacing non-printables with '.'
-    """
-    out = []
-    for v in vals:
-        if 32 <= v <= 126:
-            out.append(chr(v))
-        elif v in (10, 13, 9):
-            out.append(chr(v))
-        else:
-            out.append(".")
-    return "".join(out)
+def printable_ratio(s):
+    if not s:
+        return 0.0
+    ok = sum(1 for ch in s if (ch.isalnum() or ch in " .,;:!?-_()[]{}<>@#/\\\n\r\t"))
+    return ok / max(1, len(s))
+
+def digits_only_ratio(s):
+    if not s:
+        return 0.0
+    ok = sum(1 for ch in s if ch.isdigit())
+    return ok / max(1, len(s))
+
+# Very small RU “sanity” word hits (just to detect something plausible)
+RU_HINTS = ["КО", "ПО", "НА", "ПРИ", "СЕ", "ОТ", "ДО", "ЭТО", "ЧТО", "КАК", "ГДЕ", "КТО", "ВЫ", "МЫ", "ОН", "ОНА"]
+
+def ru_hint_hits(s):
+    ss = s.upper()
+    return sum(1 for h in RU_HINTS if h in ss)
+
+# -----------------------------
+# Autopilot pipeline
+# -----------------------------
+def autopilot_run(text, max_keylen, stop_event, log_fn, found_fn):
+    nums = extract_numeric_groups(text)
+    if not nums:
+        log_fn("No numeric groups found.")
+        return
+
+    ent = shannon_entropy_digits(nums)
+    freq, total_digits = digit_frequency(nums)
+    reps = repetitions(nums)
+
+    log_fn(f"Stats: groups={len(nums)}, total_digits={total_digits}, digit_entropy={ent:.4f} (max~3.3219)")
+    log_fn(f"Repetitions: {len(reps)} groups repeated")
+
+    # 1) Grid decode with default alphabet
+    if stop_event.is_set(): return
+    log_fn("Trying Grid(00-99) decode with default alphabet…")
+    pairs = numbers_to_pairs_00_99(nums, pad_last_digit=True)
+    grid_txt = grid_decode_pairs(pairs, DEFAULT_ALPHABET_100)
+    pr = printable_ratio(grid_txt)
+    log_fn(f"Grid decode printable_ratio={pr:.3f}")
+    if pr > 0.80 and len(grid_txt) >= 40:
+        found_fn("GRID-DEFAULT", f"printable_ratio={pr:.3f}", grid_txt[:600])
+
+    # 2) Auto Vigenere on stream values = group % 26 (EN scoring) — sometimes catches structure even if not EN
+    if stop_event.is_set(): return
+    log_fn("Trying Auto: Auto Vigenere break on values=(group % 26)…")
+    vals26 = [int(n) % 26 for n in nums]
+    top26 = break_vigenere(vals26, 26, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", chi_squared_score_en, max_keylen=max_keylen, top_k=6)
+    for c in top26:
+        if stop_event.is_set(): return
+        prev = c["preview"]
+        pr = printable_ratio(prev)
+        # heuristic: if output not random-looking and has some repeated patterns, keep it
+        if pr > 0.90 and c["score"] < 200:
+            found_fn("VIG26", f"keylen={c['keylen']} key={c['key_text']} score={c['score']:.1f}", prev)
+
+    # 3) Auto Vigenere on values = group % 33 (RU scoring)
+    if stop_event.is_set(): return
+    log_fn("Trying RU: Auto Vigenere break on values=(group % 33)…")
+    vals33 = [int(n) % 33 for n in nums]
+    top33 = break_vigenere(vals33, 33, RU_ALPHABET, chi_squared_score_ru, max_keylen=max_keylen, top_k=8)
+    for c in top33:
+        if stop_event.is_set(): return
+        prev = c["preview"]
+        hits = ru_hint_hits(prev)
+        # heuristic: keep if has some RU bigram-ish hints
+        if hits >= 2 and c["score"] < 300:
+            found_fn("VIG33-RU", f"keylen={c['keylen']} key={c['key_text']} score={c['score']:.1f} hits={hits}", prev)
+
+    # 4) Numeric Vigenere brute on pairs (mod100) with short key length 1..6, key values 0..99 (restricted search)
+    # Instead of impossible brute (100^k), we do a cheap heuristic:
+    # - assume key repeated, find best Caesar-like per column on mod100 using "printable grid text" as fitness.
+    if stop_event.is_set(): return
+    log_fn("Trying heuristic Vigenere on PAIRS (mod100) using Grid fitness (column-wise best shifts)…")
+    pair_vals = [int(p) for p in pairs if p.isdigit() and len(p) == 2]
+    if len(pair_vals) > 20:
+        for klen in range(1, min(6, max_keylen) + 1):
+            if stop_event.is_set(): return
+            key = []
+            # choose per-column shift that maximizes printable ratio after grid decode
+            for i in range(klen):
+                col = [pair_vals[j] for j in range(i, len(pair_vals), klen)]
+                best_shift = 0
+                best_fit = -1.0
+                for shift in range(100):
+                    dec_col = [(v - shift) % 100 for v in col]
+                    # rebuild full stream approx by applying this shift only to column -> too expensive.
+                    # So we evaluate on column alone with alphabet: prefer alnum/space punctuation
+                    col_pairs = [f"{v:02d}" for v in dec_col]
+                    col_txt = grid_decode_pairs(col_pairs, DEFAULT_ALPHABET_100)
+                    fit = printable_ratio(col_txt)
+                    if fit > best_fit:
+                        best_fit = fit
+                        best_shift = shift
+                key.append(best_shift)
+
+            dec_vals = vigenere_decrypt_modN(pair_vals, key, 100)
+            dec_pairs = [f"{v:02d}" for v in dec_vals]
+            dec_txt = grid_decode_pairs(dec_pairs, DEFAULT_ALPHABET_100)
+            pr = printable_ratio(dec_txt)
+            if pr > 0.85 and len(dec_txt) > 60:
+                found_fn("VIG100-PAIRS", f"keylen={klen} key={key} printable_ratio={pr:.3f}", dec_txt[:800])
+
+    # 5) mod10000 groups (4-digit only) with small keys (manual-ish): try keylen 1..4 and shift = 0..9999
+    # too big. Instead: test if subtracting a constant makes outputs cluster around ASCII bytes.
+    if stop_event.is_set(): return
+    log_fn("Trying mod10000: constant-shift scan (0..9999 step 37) to see ASCII-likeness…")
+    g4 = [n for n in nums if len(n) == 4]
+    if len(g4) >= 12:
+        g4v = [int(x) for x in g4]
+        best = (0, -1.0, "")
+        for shift in range(0, 10000, 37):
+            if stop_event.is_set(): return
+            dec = [((v - shift) % 10000) % 256 for v in g4v]
+            s = "".join(chr(b) if 32 <= b <= 126 else "." for b in dec)
+            pr = printable_ratio(s)
+            if pr > best[1]:
+                best = (shift, pr, s)
+        if best[1] > 0.70:
+            found_fn("MOD10000-SHIFT", f"best_shift={best[0]} ascii_printable_ratio={best[1]:.3f}", best[2][:400])
+
+    log_fn("Autopilot finished. If nothing meaningful found, πιθανότατα είναι OTP ή χρειάζεται codebook/key.")
 
 # -----------------------------
 # GUI
 # -----------------------------
-class CipherLabGUI(tk.Tk):
+class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Cipher Lab GUI (Hypothesis Tester)")
-        self.geometry("1100x750")
+        self.title("Cipher Autopilot Lab (RU/EN/Grid/Vigenere)")
+        self.geometry("1200x820")
+
+        self.worker = None
+        self.stop_event = threading.Event()
+        self.ui_queue = queue.Queue()
 
         self._build_ui()
+        self._pump_ui_queue()
 
     def _build_ui(self):
-        # Top controls
         top = ttk.Frame(self)
         top.pack(fill="x", padx=10, pady=8)
 
-        ttk.Button(top, text="Load Text File…", command=self.load_file).pack(side="left")
-        ttk.Button(top, text="Run All Analyses", command=self.run_all).pack(side="left", padx=6)
-        ttk.Button(top, text="Clear", command=self.clear_all).pack(side="left", padx=6)
+        ttk.Button(top, text="Load .txt…", command=self.load_file).pack(side="left")
+        ttk.Button(top, text="Run Autopilot", command=self.run_autopilot).pack(side="left", padx=6)
+        ttk.Button(top, text="STOP", command=self.stop_autopilot).pack(side="left", padx=6)
 
-        ttk.Label(top, text="Max keylen (auto Vigenere mod26):").pack(side="left", padx=(30, 6))
-        self.max_keylen_var = tk.StringVar(value="12")
-        ttk.Entry(top, width=5, textvariable=self.max_keylen_var).pack(side="left")
+        ttk.Label(top, text="Max keylen:").pack(side="left", padx=(20, 6))
+        self.max_keylen_var = tk.StringVar(value="16")
+        ttk.Entry(top, width=6, textvariable=self.max_keylen_var).pack(side="left")
 
-        # Notebook tabs
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.tab_input = ttk.Frame(nb)
-        self.tab_stats = ttk.Frame(nb)
-        self.tab_grid = ttk.Frame(nb)
-        self.tab_vig = ttk.Frame(nb)
-        self.tab_auto = ttk.Frame(nb)
+        self.tab_log = ttk.Frame(nb)
+        self.tab_found = ttk.Frame(nb)
+        self.tab_parse = ttk.Frame(nb)
 
         nb.add(self.tab_input, text="Input")
-        nb.add(self.tab_stats, text="Stats")
-        nb.add(self.tab_grid, text="Grid Decoder (00-99)")
-        nb.add(self.tab_vig, text="Vigenere Numeric")
-        nb.add(self.tab_auto, text="Auto Hypothesis Tester")
+        nb.add(self.tab_parse, text="Parse Preview")
+        nb.add(self.tab_log, text="Log")
+        nb.add(self.tab_found, text="Top Findings")
 
-        self._build_input_tab()
-        self._build_stats_tab()
-        self._build_grid_tab()
-        self._build_vig_tab()
-        self._build_auto_tab()
-
-    def _build_input_tab(self):
-        frm = self.tab_input
-
-        ttk.Label(frm, text="Paste your transmissions here:").pack(anchor="w", padx=6, pady=(6, 2))
-        self.input_text = tk.Text(frm, wrap="none", height=18)
+        # Input tab
+        ttk.Label(self.tab_input, text="Paste transmissions here:").pack(anchor="w", padx=6, pady=(6, 2))
+        self.input_text = tk.Text(self.tab_input, wrap="none", height=24)
         self.input_text.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Output parse preview
-        ttk.Label(frm, text="Parse preview (first lines):").pack(anchor="w", padx=6, pady=(10, 2))
-        self.parse_preview = tk.Text(frm, wrap="none", height=10, state="disabled")
-        self.parse_preview.pack(fill="both", expand=False, padx=6, pady=(0, 6))
+        # Parse tab
+        self.parse_text = tk.Text(self.tab_parse, wrap="none", state="disabled")
+        self.parse_text.pack(fill="both", expand=True, padx=6, pady=6)
 
-    def _build_stats_tab(self):
-        frm = self.tab_stats
-        self.stats_out = tk.Text(frm, wrap="none", state="disabled")
-        self.stats_out.pack(fill="both", expand=True, padx=6, pady=6)
+        # Log tab
+        self.log_text = tk.Text(self.tab_log, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
 
-    def _build_grid_tab(self):
-        frm = self.tab_grid
+        # Found tab
+        self.found_text = tk.Text(self.tab_found, wrap="word", state="disabled")
+        self.found_text.pack(fill="both", expand=True, padx=6, pady=6)
 
-        top = ttk.Frame(frm)
-        top.pack(fill="x", padx=6, pady=6)
-
-        ttk.Label(top, text="Alphabet (100 chars, index 00..99):").pack(side="left")
-        self.alpha_var = tk.StringVar(value=DEFAULT_ALPHABET_100)
-        alpha_entry = ttk.Entry(top, textvariable=self.alpha_var)
-        alpha_entry.pack(side="left", fill="x", expand=True, padx=6)
-
-        ttk.Button(top, text="Decode Using Grid", command=self.run_grid_decode).pack(side="left", padx=6)
-
-        self.grid_out = tk.Text(frm, wrap="word", state="disabled")
-        self.grid_out.pack(fill="both", expand=True, padx=6, pady=6)
-
-    def _build_vig_tab(self):
-        frm = self.tab_vig
-
-        cfg = ttk.LabelFrame(frm, text="Vigenere Numeric Decrypt (experiments)")
-        cfg.pack(fill="x", padx=6, pady=6)
-
-        row1 = ttk.Frame(cfg); row1.pack(fill="x", padx=6, pady=4)
-        ttk.Label(row1, text="Mode:").pack(side="left")
-        self.vig_mode = tk.StringVar(value="mod26_letters")
-        ttk.Radiobutton(row1, text="mod26 letters (values = group%26)", variable=self.vig_mode, value="mod26_letters").pack(side="left", padx=6)
-        ttk.Radiobutton(row1, text="mod100 pairs (00-99)", variable=self.vig_mode, value="mod100_pairs").pack(side="left", padx=6)
-        ttk.Radiobutton(row1, text="mod10000 groups (0000-9999)", variable=self.vig_mode, value="mod10000_groups").pack(side="left", padx=6)
-
-        row2 = ttk.Frame(cfg); row2.pack(fill="x", padx=6, pady=4)
-        ttk.Label(row2, text="Key (comma-separated ints):").pack(side="left")
-        self.vig_key_var = tk.StringVar(value="1,2,3")
-        ttk.Entry(row2, textvariable=self.vig_key_var).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(row2, text="Decrypt", command=self.run_vigenere_numeric).pack(side="left", padx=6)
-
-        self.vig_out = tk.Text(frm, wrap="word", state="disabled")
-        self.vig_out.pack(fill="both", expand=True, padx=6, pady=6)
-
-    def _build_auto_tab(self):
-        frm = self.tab_auto
-
-        info = ttk.LabelFrame(frm, text="Auto Hypothesis Tester")
-        info.pack(fill="x", padx=6, pady=6)
-
-        ttk.Label(info, text=(
-            "Tries classical Vigenere break on stream: value = (numeric_group % 26).\n"
-            "If your plaintext is not English-like, score may be misleading — but it will still reveal structure if it's not OTP."
-        )).pack(anchor="w", padx=6, pady=6)
-
-        ttk.Button(info, text="Run Auto Vigenere(mod26) Break", command=self.run_auto_vigenere).pack(anchor="w", padx=6, pady=(0,6))
-
-        self.auto_out = tk.Text(frm, wrap="word", state="disabled")
-        self.auto_out.pack(fill="both", expand=True, padx=6, pady=6)
-
-    # -----------------------------
-    # Actions
-    # -----------------------------
     def get_input(self):
         return self.input_text.get("1.0", "end").strip("\n")
 
@@ -389,215 +411,96 @@ class CipherLabGUI(tk.Tk):
                 data = f.read()
             self.input_text.delete("1.0", "end")
             self.input_text.insert("1.0", data)
-            self.run_all()
+            self.refresh_parse_preview()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file:\n{e}")
 
-    def clear_all(self):
-        self.input_text.delete("1.0", "end")
-        for box in (self.parse_preview, self.stats_out, self.grid_out, self.vig_out, self.auto_out):
-            box.configure(state="normal")
-            box.delete("1.0", "end")
-            box.configure(state="disabled")
-
-    def run_all(self):
-        text = self.get_input()
-        if not text.strip():
-            return
-        self.run_parse_preview()
-        self.run_stats()
-        # grid/vig/auto are on-demand
-
-    def run_parse_preview(self):
+    def refresh_parse_preview(self):
         text = self.get_input()
         records = extract_tokens_per_line(text)
-
         lines = []
-        shown = 0
-        for r in records:
-            if shown >= 12:
-                break
+        for r in records[:25]:
             if not r.get("parsed"):
                 lines.append(f"[UNPARSED] {r.get('raw')}")
-                shown += 1
-                continue
-            tokens = r["tokens"]
-            nums = [t for t in tokens if re.fullmatch(r"\d{4,5}", t)]
-            words = [t for t in tokens if not re.fullmatch(r"\d{4,5}", t)]
-            lines.append(
-                f"{r['prefix']} {r['msg_id']} | words={words} | nums={nums}"
-            )
-            shown += 1
+            else:
+                lines.append(f"{r['prefix']} {r['msg_id']} | words={r['words']} | nums={r['nums']}")
+        self._set_text(self.parse_text, "\n".join(lines) if lines else "(no lines)")
 
-        self.parse_preview.configure(state="normal")
-        self.parse_preview.delete("1.0", "end")
-        self.parse_preview.insert("1.0", "\n".join(lines))
-        self.parse_preview.configure(state="disabled")
-
-    def run_stats(self):
+    def run_autopilot(self):
         text = self.get_input()
-        nums = extract_numeric_groups(text)
-        freq, total_digits = digit_frequency(nums)
-        ent = shannon_entropy_digits(nums)
-        reps = repetitions(nums)
-
-        out = []
-        out.append(f"Total numeric groups (4/5 digits): {len(nums)}")
-        out.append(f"Total digits across groups: {total_digits}")
-        out.append(f"Digit Shannon entropy: {ent:.4f} bits (max for digits ~ 3.3219)")
-        out.append("")
-        out.append("Digit frequency:")
-        for d in "0123456789":
-            out.append(f"  {d}: {freq[d]}")
-        out.append("")
-        out.append("Repetitions (groups appearing more than once):")
-        if reps:
-            for g, c in sorted(reps, key=lambda x: (-x[1], x[0]))[:50]:
-                out.append(f"  {g}  x{c}")
-            if len(reps) > 50:
-                out.append(f"  ... and {len(reps)-50} more")
-        else:
-            out.append("  (none)")
-
-        self.stats_out.configure(state="normal")
-        self.stats_out.delete("1.0", "end")
-        self.stats_out.insert("1.0", "\n".join(out))
-        self.stats_out.configure(state="disabled")
-
-    def run_grid_decode(self):
-        text = self.get_input()
-        nums = extract_numeric_groups(text)
-        alpha = self.alpha_var.get()
-
-        if len(alpha) < 100:
-            messagebox.showwarning("Alphabet too short", "Alphabet must be at least 100 characters. Padding with '~'.")
-            alpha = (alpha + ("~" * 100))[:100]
-        else:
-            alpha = alpha[:100]
-
-        pairs = numbers_to_pairs_00_99(nums)
-        decoded = grid_decode_pairs(pairs, alpha)
-
-        out = []
-        out.append("Grid Decode (00-99) over digit-pairs derived from numeric groups.")
-        out.append("Note: 5-digit groups are chunked as pairs; last odd digit is padded with 0.")
-        out.append("")
-        out.append(decoded)
-
-        self.grid_out.configure(state="normal")
-        self.grid_out.delete("1.0", "end")
-        self.grid_out.insert("1.0", "\n".join(out))
-        self.grid_out.configure(state="disabled")
-
-    def run_vigenere_numeric(self):
-        text = self.get_input()
-        mode = self.vig_mode.get()
-
-        key_str = self.vig_key_var.get().strip()
-        if not key_str:
-            messagebox.showerror("Key error", "Please provide a key (comma-separated integers).")
+        if not text.strip():
+            messagebox.showinfo("Empty", "Paste or load some transmissions first.")
             return
+
+        self.refresh_parse_preview()
 
         try:
-            key_nums = [int(x.strip()) for x in key_str.split(",") if x.strip() != ""]
-        except Exception:
-            messagebox.showerror("Key error", "Key must be comma-separated integers, e.g. 3,1,4")
-            return
-
-        nums_str = extract_numeric_groups(text)
-        if not nums_str:
-            messagebox.showinfo("No numbers", "No 4/5-digit numeric groups found.")
-            return
-
-        out = []
-        out.append(f"Mode: {mode}")
-        out.append(f"Key: {key_nums}")
-        out.append("")
-
-        if mode == "mod26_letters":
-            vals = [int(n) % 26 for n in nums_str]
-            # key must also be 0..25
-            k = [x % 26 for x in key_nums]
-            pt = vigenere_decrypt_mod26(vals, k)
-            out.append("Decrypted letters (A-Z) from values = group % 26:")
-            out.append(pt[:1000])
-
-        elif mode == "mod100_pairs":
-            # derive pairs 00-99, then treat each pair as 0..99 and decrypt mod100
-            pairs = numbers_to_pairs_00_99(nums_str)
-            vals = [int(p) for p in pairs if p.isdigit() and len(p) == 2]
-            k = [x % 100 for x in key_nums]
-            pt_vals = vigenere_decrypt_modN(vals, k, 100)
-            # map back to pairs then to grid text using current alphabet
-            alpha = self.alpha_var.get()
-            if len(alpha) < 100:
-                alpha = (alpha + ("~" * 100))[:100]
-            else:
-                alpha = alpha[:100]
-            pair_strs = [f"{v:02d}" for v in pt_vals]
-            decoded = grid_decode_pairs(pair_strs, alpha)
-            out.append("Decrypted pairs -> Grid decoded text:")
-            out.append(decoded[:2000])
-
-        elif mode == "mod10000_groups":
-            # use 4-digit groups only (ignore 5-digit) for cleaner mod10000
-            g4 = [n for n in nums_str if len(n) == 4]
-            if not g4:
-                out.append("No 4-digit groups found to run mod10000.")
-            else:
-                vals = [int(n) for n in g4]
-                k = [x % 10000 for x in key_nums]
-                pt_vals = vigenere_decrypt_modN(vals, k, 10000)
-                out.append("Decrypted 4-digit values (mod 10000), first 120 values:")
-                out.append(" ".join(f"{v:04d}" for v in pt_vals[:120]))
-                out.append("")
-                # optionally map to bytes by mod256 and show printable preview
-                bytes_vals = [v % 256 for v in pt_vals]
-                out.append("ASCII-ish preview (value % 256 -> printable):")
-                out.append(ints_to_printable_ascii(bytes_vals)[:2000])
-
-        else:
-            out.append("Unknown mode.")
-
-        self.vig_out.configure(state="normal")
-        self.vig_out.delete("1.0", "end")
-        self.vig_out.insert("1.0", "\n".join(out))
-        self.vig_out.configure(state="disabled")
-
-    def run_auto_vigenere(self):
-        text = self.get_input()
-        nums_str = extract_numeric_groups(text)
-        if not nums_str:
-            messagebox.showinfo("No numbers", "No 4/5-digit numeric groups found.")
-            return
-
-        try:
-            max_k = int(self.max_keylen_var.get().strip())
-            max_k = max(1, min(max_k, 40))
+            max_keylen = int(self.max_keylen_var.get().strip())
+            max_keylen = max(1, min(max_keylen, 40))
         except:
-            max_k = 12
+            max_keylen = 16
 
-        values = [int(n) % 26 for n in nums_str]
-        top = break_vigenere_mod26(values, max_keylen=max_k, top_k=8)
+        # reset
+        self.stop_event.clear()
+        self._append_log("Starting autopilot…")
+        self._append_found("")
 
-        out = []
-        out.append(f"Auto Vigenere(mod26) break on stream values = group % 26")
-        out.append(f"Tested key lengths: 1..{max_k}")
-        out.append("")
-        out.append("Best candidates (lower score ~ more English-like):")
-        out.append("")
+        # start worker
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Running", "Autopilot is already running.")
+            return
 
-        for i, c in enumerate(top, 1):
-            out.append(f"[{i}] keylen={c['keylen']}  key={c['key_text']}  score={c['score']:.2f}")
-            out.append(f"Preview: {c['preview']}")
-            out.append("-" * 70)
+        self.worker = threading.Thread(
+            target=autopilot_run,
+            args=(text, max_keylen, self.stop_event, self._log_from_worker, self._found_from_worker),
+            daemon=True
+        )
+        self.worker.start()
 
-        self.auto_out.configure(state="normal")
-        self.auto_out.delete("1.0", "end")
-        self.auto_out.insert("1.0", "\n".join(out))
-        self.auto_out.configure(state="disabled")
+    def stop_autopilot(self):
+        self.stop_event.set()
+        self._append_log("STOP requested. Waiting for worker to exit…")
 
+    # UI queue pump
+    def _pump_ui_queue(self):
+        try:
+            while True:
+                kind, payload = self.ui_queue.get_nowait()
+                if kind == "log":
+                    self._append_log(payload)
+                elif kind == "found":
+                    tag, meta, preview = payload
+                    self._append_found(f"\n=== {tag} | {meta} ===\n{preview}\n")
+        except queue.Empty:
+            pass
+        self.after(120, self._pump_ui_queue)
+
+    # worker -> UI
+    def _log_from_worker(self, msg):
+        self.ui_queue.put(("log", msg))
+
+    def _found_from_worker(self, tag, meta, preview):
+        self.ui_queue.put(("found", (tag, meta, preview)))
+
+    # text helpers
+    def _set_text(self, widget, text):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _append_log(self, line):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line.rstrip() + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _append_found(self, block):
+        self.found_text.configure(state="normal")
+        self.found_text.insert("end", block)
+        self.found_text.see("end")
+        self.found_text.configure(state="disabled")
 
 if __name__ == "__main__":
-    app = CipherLabGUI()
+    app = App()
     app.mainloop()
